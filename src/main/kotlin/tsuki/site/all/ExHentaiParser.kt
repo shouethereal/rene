@@ -21,22 +21,31 @@ import tsuki.model.*
 import tsuki.util.*
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.Collections.emptyList
 import java.util.concurrent.TimeUnit
 
 private const val DOMAIN_UNAUTHORIZED = "e-hentai.org"
 private const val DOMAIN_AUTHORIZED = "exhentai.org"
-private val TAG_PREFIXES = arrayOf("male:", "female:", "other:")
-private const val BANNED_RESPONSE_LENGTH = 256L
-private const val SUSPICIOUS_TAG_KEY = "tsuki_special_adv_suspicious"
 
-@MangaSourceParser(name = "EXHENTAI", title = "ExHentai", type = ContentType.HENTAI)
-internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(context, MangaParserSource.OTHER, pageSize = 25), MangaParserAuthProvider, Interceptor {
+private val TAG_PREFIXES = arrayOf("male:", "female:", "other:")
+
+private const val BANNED_RESPONSE_LENGTH = 256L
+
+@MangaSourceParser("EXHENTAI", "ExHentai", type = ContentType.HENTAI)
+internal class ExHentaiParser(
+    context: MangaLoaderContext,
+) : PagedMangaParser(
+    context,
+    MangaParserSource.EXHENTAI,
+    pageSize = 25,
+), MangaParserAuthProvider, Interceptor {
 
     override val availableSortOrders: Set<SortOrder> = setOf(SortOrder.NEWEST)
 
     override val configKeyDomain: ConfigKey.Domain
         get() {
             val isAuthorized = checkAuth()
+
             return ConfigKey.Domain(
                 if (isAuthorized) DOMAIN_AUTHORIZED else DOMAIN_UNAUTHORIZED,
                 if (isAuthorized) DOMAIN_UNAUTHORIZED else DOMAIN_AUTHORIZED,
@@ -49,8 +58,30 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
     private val ratingPattern = Regex("-?[0-9]+px")
     private val titleCleanupPattern = Regex("(\\[.*?]|\\([C0-9]*\\))")
     private val spacesCleanupPattern = Regex("(^\\s+|\\s+\$|\\s+(?=\\s))")
-    private val authCookies = arrayOf("ipb_member_id", "ipb_pass_hash")
-    private val igneousKey = ConfigKey.String("igneous_cookie", "Igneous Cookie (Opsional)", "")
+
+    private val authCookies = arrayOf(
+        "ipb_member_id",
+        "ipb_pass_hash",
+        "igneous",
+    )
+
+    /*
+     * ExHentai authentication cookie.
+     *
+     * This value can be entered/edited from the source settings.
+     */
+    private val igneousCookieKey = ConfigKey.String(
+        key = "exhentai_igneous",
+        defaultValue = "",
+    )
+
+    /*
+     * Suspicious content remains a configuration key, but is intentionally
+     * kept separate from authentication settings.
+     */
+    private val suspiciousContentKey =
+        ConfigKey.ShowSuspiciousContent(false)
+
     private val nextPages = MutableIntObjectMap<MutableIntLongMap>()
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -65,26 +96,75 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
     override suspend fun isAuthorized(): Boolean = checkAuth()
 
     init {
-        context.cookieJar.insertCookies(DOMAIN_AUTHORIZED, "nw=1", "sl=dm_2")
-        context.cookieJar.insertCookies(DOMAIN_UNAUTHORIZED, "nw=1", "sl=dm_2")
+        context.cookieJar.insertCookies(
+            DOMAIN_AUTHORIZED,
+            "nw=1",
+            "sl=dm_2",
+        )
+
+        context.cookieJar.insertCookies(
+            DOMAIN_UNAUTHORIZED,
+            "nw=1",
+            "sl=dm_2",
+        )
+
+        applyIgneousCookie()
+
         paginator.firstPage = 0
         searchPaginator.firstPage = 0
     }
 
+    /**
+     * Apply the manually configured igneous cookie to both E-Hentai
+     * and ExHentai domains.
+     */
+    private fun applyIgneousCookie() {
+        val igneous = config[igneousCookieKey]
+            .trim()
+            .takeIf { it.isNotEmpty() }
+            ?: return
+
+        context.cookieJar.insertCookies(
+            DOMAIN_AUTHORIZED,
+            "igneous=$igneous",
+        )
+
+        context.cookieJar.insertCookies(
+            DOMAIN_UNAUTHORIZED,
+            "igneous=$igneous",
+        )
+    }
+
     override suspend fun getFilterOptions() = MangaListFilterOptions(
         availableTags = mapTags(),
+
+        /*
+         * Requires the corresponding ContentType enum members to exist:
+         *
+         * DOUJINSHI
+         * MANGA
+         * ARTIST_CG
+         * GAME_CG
+         * WESTERN
+         * NON_H
+         * IMAGE_SET
+         * COSPLAY
+         * ASIAN_PORN
+         * MISC
+         */
         availableContentTypes = EnumSet.of(
             ContentType.DOUJINSHI,
             ContentType.MANGA,
             ContentType.ARTIST_CG,
             ContentType.GAME_CG,
             ContentType.WESTERN,
-            ContentType.COMICS,
+            ContentType.NON_H,
             ContentType.IMAGE_SET,
             ContentType.COSPLAY,
             ContentType.ASIAN_PORN,
             ContentType.MISC,
         ),
+
         availableLocales = setOf(
             Locale.JAPANESE,
             Locale.ENGLISH,
@@ -104,10 +184,17 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
         ),
     )
 
-    // Menyesuaikan dengan kontrak MangaParser terbaru menggunakan offset
-    override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        val page = offset / pageSize
-        return getListPage(page, order, filter, updateDm = false)
+    override suspend fun getListPage(
+        page: Int,
+        order: SortOrder,
+        filter: MangaListFilter,
+    ): List<Manga> {
+        return getListPage(
+            page,
+            order,
+            filter,
+            updateDm = false,
+        )
     }
 
     private suspend fun getListPage(
@@ -116,6 +203,13 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
         filter: MangaListFilter,
         updateDm: Boolean,
     ): List<Manga> {
+
+        /*
+         * Make sure the manually configured igneous cookie is applied
+         * before making requests.
+         */
+        applyIgneousCookie()
+
         val next = synchronized(nextPages) {
             nextPages[filter.hashCode()]?.getOrDefault(page, 0L) ?: 0L
         }
@@ -126,33 +220,66 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
         }
 
         val isAuthorizedDomain = domain == DOMAIN_AUTHORIZED
+
         val url = urlBuilder()
+
         if (page > 0 || !isAuthorizedDomain) {
-            url.addEncodedQueryParameter("next", next.toString())
+            url.addEncodedQueryParameter(
+                "next",
+                next.toString(),
+            )
         }
+
         val searchQuery = filter.toSearchQuery()
+
         if (searchQuery != null || !isAuthorizedDomain) {
-            url.addQueryParameter("f_search", searchQuery)
+            url.addQueryParameter(
+                "f_search",
+                searchQuery,
+            )
         }
 
         val fCats = filter.types.toFCats()
+
         if (fCats != 0) {
-            url.addEncodedQueryParameter("f_cats", (1023 - fCats).toString())
+            url.addEncodedQueryParameter(
+                "f_cats",
+                (1023 - fCats).toString(),
+            )
         }
+
         if (updateDm) {
-            url.addQueryParameter("inline_set", "dm_e")
+            url.addQueryParameter(
+                "inline_set",
+                "dm_e",
+            )
         }
-        
-        val showSuspiciousContent = filter.tags.any { it.key == SUSPICIOUS_TAG_KEY }
-        
+
+        val showSuspiciousContent = config[suspiciousContentKey]
+
         if (!isAuthorizedDomain || showSuspiciousContent) {
-            url.addQueryParameter("advsearch", "1")
+            url.addQueryParameter(
+                "advsearch",
+                "1",
+            )
         }
+
         if (showSuspiciousContent) {
-            url.addQueryParameter("f_sh", "on")
+            url.addQueryParameter(
+                "f_sh",
+                "on",
+            )
         }
-        val body = webClient.httpGet(url.build()).parseHtml().body()
-        val root = body.selectFirst("table.itg")?.selectFirst("tbody")
+
+        val body = webClient
+            .httpGet(url.build())
+            .parseHtml()
+            .body()
+
+        val root = body
+            .selectFirst("table.itg")
+            ?.selectFirst("tbody")
+
         if (root == null) {
             if (updateDm) {
                 if (body.getElementsContainingText("No hits found").isNotEmpty()) {
@@ -161,124 +288,249 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
                     body.parseFailed("Cannot find root")
                 }
             } else {
-                return getListPage(page, order, filter, updateDm = true)
+                return getListPage(
+                    page,
+                    order,
+                    filter,
+                    updateDm = true,
+                )
             }
         }
+
         val nextTimestamp = getNextTimestamp(body)
+
         synchronized(nextPages) {
-            nextPages.getOrPut(filter.hashCode()) {
-                MutableIntLongMap()
-            }.put(page + 1, nextTimestamp)
+            nextPages
+                .getOrPut(filter.hashCode()) {
+                    MutableIntLongMap()
+                }
+                .put(
+                    page + 1,
+                    nextTimestamp,
+                )
         }
 
         return root.children().mapNotNull { tr ->
-            if (tr.childrenSize() != 2) return@mapNotNull null
+            if (tr.childrenSize() != 2) {
+                return@mapNotNull null
+            }
+
             val (td1, td2) = tr.children()
+
             val gLink = td2.selectFirstOrThrow("div.glink")
-            val a = gLink.parents().select("a").first() ?: gLink.parseFailed("link not found")
+
+            val a = gLink
+                .parents()
+                .select("a")
+                .first()
+                ?: gLink.parseFailed("link not found")
+
             val href = a.attrAsRelativeUrl("href")
-            val tagsDiv = gLink.nextElementSibling() ?: gLink.parseFailed("tags div not found")
+
+            val tagsDiv = gLink.nextElementSibling()
+                ?: gLink.parseFailed("tags div not found")
+
             val rawTitle = gLink.text()
-            val authorElement = tagsDiv.getElementsContainingOwnText("artist:").first()
-                ?.nextElementSibling()?.textOrNull()
-                
+
+            val author = tagsDiv
+                .getElementsContainingOwnText("artist:")
+                .first()
+                ?.nextElementSibling()
+                ?.textOrNull()
+
             Manga(
                 id = generateUid(href),
                 title = rawTitle.toMangaTitle(),
                 altTitles = emptySet(),
                 url = href,
                 publicUrl = a.absUrl("href"),
-                rating = td2.selectFirst("div.ir")?.parseRating() ?: RATING_UNKNOWN,
+                rating = td2
+                    .selectFirst("div.ir")
+                    ?.parseRating()
+                    ?: RATING_UNKNOWN,
                 contentRating = ContentRating.ADULT,
-                coverUrl = td1.selectFirst("img")?.attrAsAbsoluteUrlOrNull("src"),
+                coverUrl = td1
+                    .selectFirst("img")
+                    ?.attrAsAbsoluteUrlOrNull("src"),
                 tags = tagsDiv.parseTags(),
                 state = when {
-                    rawTitle.contains("(ongoing)", ignoreCase = true) -> MangaState.ONGOING
+                    rawTitle.contains(
+                        "(ongoing)",
+                        ignoreCase = true,
+                    ) -> MangaState.ONGOING
+
                     else -> null
                 },
-                authors = setOfNotNull(authorElement),
+                authors = setOfNotNull(author),
                 source = source,
             )
         }
     }
 
     override suspend fun getDetails(manga: Manga): Manga {
-        val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
-        val root = doc.body().selectFirstOrThrow("div.gm")
-        val cover = root.getElementById("gd1")?.children()?.first()
+        applyIgneousCookie()
+
+        val doc = webClient
+            .httpGet(manga.url.toAbsoluteUrl(domain))
+            .parseHtml()
+
+        val root = doc.body()
+            .selectFirstOrThrow("div.gm")
+
+        val cover = root
+            .getElementById("gd1")
+            ?.children()
+            ?.first()
+
         val title = root.getElementById("gd2")
         val tagList = root.getElementById("taglist")
-        val tabs = doc.body().selectFirst("table.ptt")?.selectFirst("tr")
+        val tabs = doc.body()
+            .selectFirst("table.ptt")
+            ?.selectFirst("tr")
+
         val gd3 = root.getElementById("gd3")
+
         val lang = gd3
             ?.selectFirst("tr:contains(Language)")
-            ?.selectFirst(".gdt2")?.ownTextOrNull()
+            ?.selectFirst(".gdt2")
+            ?.ownTextOrNull()
+
         val uploadDate = gd3
             ?.selectFirst("tr:contains(Posted)")
-            ?.selectFirst(".gdt2")?.ownTextOrNull()
-            .let { SimpleDateFormat("yyyy-MM-dd HH:mm", sourceLocale).parseSafe(it) }
+            ?.selectFirst(".gdt2")
+            ?.ownTextOrNull()
+            .let {
+                SimpleDateFormat(
+                    "yyyy-MM-dd HH:mm",
+                    sourceLocale,
+                ).parseSafe(it)
+            }
+
         val uploader = gd3
-            ?.getElementsByAttributeValueContaining("href", "/uploader/")
+            ?.getElementsByAttributeValueContaining(
+                "href",
+                "/uploader/",
+            )
             ?.firstOrNull()
             ?.ownTextOrNull()
-        val tags = tagList?.parseTags().orEmpty()
+
+        val tags = tagList
+            ?.parseTags()
+            .orEmpty()
 
         return manga.copy(
-            title = title?.getElementById("gn")?.text()?.toMangaTitle() ?: manga.title,
-            altTitles = setOfNotNull(title?.getElementById("gj")?.text()?.toMangaTitle()?.nullIfEmpty()),
-            publicUrl = doc.baseUri().ifEmpty { manga.publicUrl },
-            rating = root.getElementById("rating_label")?.text()
+            title = title
+                ?.getElementById("gn")
+                ?.text()
+                ?.toMangaTitle()
+                ?: manga.title,
+
+            altTitles = setOfNotNull(
+                title
+                    ?.getElementById("gj")
+                    ?.text()
+                    ?.toMangaTitle()
+                    ?.nullIfEmpty(),
+            ),
+
+            publicUrl = doc
+                .baseUri()
+                .ifEmpty {
+                    manga.publicUrl
+                },
+
+            rating = root
+                .getElementById("rating_label")
+                ?.text()
                 ?.substringAfterLast(' ')
                 ?.toFloatOrNull()
-                ?.div(5f) ?: manga.rating,
-            largeCoverUrl = cover?.styleValueOrNull("background")?.cssUrl(),
+                ?.div(5f)
+                ?: manga.rating,
+
+            largeCoverUrl = cover
+                ?.styleValueOrNull("background")
+                ?.cssUrl(),
+
             tags = manga.tags + tags,
-            description = tagList?.select("tr")?.joinToString("<br>") { tr ->
-                val (tc, td) = tr.children()
-                val subTags = td.select("a").joinToString { it.html() }
-                "<b>${tc.html()}</b> $subTags"
-            },
-            chapters = tabs?.select("a")?.findLast { a ->
-                a.text().toIntOrNull() != null
-            }?.let { a ->
-                val count = a.text().toInt()
-                val chapters = ChaptersListBuilder(count)
-                for (i in 1..count) {
-                    val url = "${manga.url}?p=${i - 1}"
-                    chapters += MangaChapter(
-                        id = generateUid(url),
-                        title = null,
-                        number = i.toFloat(),
-                        volume = 0,
-                        url = url,
-                        uploadDate = uploadDate,
-                        source = source,
-                        scanlator = uploader,
-                        branch = lang,
-                    )
+
+            description = tagList
+                ?.select("tr")
+                ?.joinToString("<br>") { tr ->
+                    val (tc, td) = tr.children()
+                    val subTags = td
+                        .select("a")
+                        .joinToString { it.html() }
+
+                    "<b>${tc.html()}</b> $subTags"
+                },
+
+            chapters = tabs
+                ?.select("a")
+                ?.findLast {
+                    it.text().toIntOrNull() != null
                 }
-                chapters.toList()
-            },
+                ?.let { a ->
+                    val count = a.text().toInt()
+                    val chapters = ChaptersListBuilder(count)
+
+                    for (i in 1..count) {
+                        val url = "${manga.url}?p=${i - 1}"
+
+                        chapters += MangaChapter(
+                            id = generateUid(url),
+                            title = null,
+                            number = i.toFloat(),
+                            volume = 0,
+                            url = url,
+                            uploadDate = uploadDate,
+                            source = source,
+                            scanlator = uploader,
+                            branch = lang,
+                        )
+                    }
+
+                    chapters.toList()
+                },
         )
     }
 
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
-        val root = doc.body().requireElementById("gdt")
+    override suspend fun getPages(
+        chapter: MangaChapter,
+    ): List<MangaPage> {
+
+        applyIgneousCookie()
+
+        val doc = webClient
+            .httpGet(chapter.url.toAbsoluteUrl(domain))
+            .parseHtml()
+
+        val root = doc.body()
+            .requireElementById("gdt")
+
         return root.select("a").map { a ->
             val url = a.attrAsRelativeUrl("href")
+
             MangaPage(
                 id = generateUid(url),
                 url = url,
-                preview = a.children().firstOrNull()?.extractPreview(),
+                preview = a.children()
+                    .firstOrNull()
+                    ?.extractPreview(),
                 source = source,
             )
         }
     }
 
     override suspend fun getPageUrl(page: MangaPage): String {
-        val doc = webClient.httpGet(page.url.toAbsoluteUrl(domain)).parseHtml()
-        return doc.body().requireElementById("img").attrAsAbsoluteUrl("src")
+        applyIgneousCookie()
+
+        val doc = webClient
+            .httpGet(page.url.toAbsoluteUrl(domain))
+            .parseHtml()
+
+        return doc.body()
+            .requireElementById("img")
+            .attrAsAbsoluteUrl("src")
     }
 
     @Suppress("SpellCheckingInspection")
@@ -300,59 +552,111 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
 
     private fun mapTags(): Set<MangaTag> {
         val tagElements = tags.split(",")
-        val result = ArraySet<MangaTag>(tagElements.size + 1)
-        
-        result += MangaTag(
-            title = "⚠️ Show Suspicious/Expunged",
-            key = SUSPICIOUS_TAG_KEY,
-            source = source,
-        )
-        
+        val result = ArraySet<MangaTag>(tagElements.size)
+
         for (tag in tagElements) {
             val el = tag.trim()
-            if (el.isEmpty()) continue
+
+            if (el.isEmpty()) {
+                continue
+            }
+
             result += MangaTag(
                 title = el.toTitleCase(Locale.ENGLISH),
                 key = el,
                 source = source,
             )
         }
+
         return result
     }
 
-    override fun intercept(chain: Interceptor.Chain): Response {
+    override fun intercept(
+        chain: Interceptor.Chain,
+    ): Response {
+
         val response = chain.proceed(chain.request())
-        val contentLength = response.header("Content-Length")?.toLongOrNull() ?: 0L
-        if (contentLength > 0 && contentLength <= BANNED_RESPONSE_LENGTH) {
-            val text = response.peekBody(BANNED_RESPONSE_LENGTH).use { it.string() }
-            if (text.contains("IP address has been temporarily banned", ignoreCase = true)) {
-                val hours = Regex("([0-9]+) hours?").find(text)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0
-                val minutes = Regex("([0-9]+) minutes?").find(text)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0
-                val seconds = Regex("([0-9]+) seconds?").find(text)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0
+
+        if (response.headersContentLength(BANNED_RESPONSE_LENGTH) <= BANNED_RESPONSE_LENGTH) {
+            val text = response
+                .peekBody(BANNED_RESPONSE_LENGTH)
+                .use { it.string() }
+
+            if (text.contains(
+                    "IP address has been temporarily banned",
+                    ignoreCase = true,
+                )
+            ) {
+                val hours = Regex("([0-9]+) hours?")
+                    .find(text)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toLongOrNull()
+                    ?: 0
+
+                val minutes = Regex("([0-9]+) minutes?")
+                    .find(text)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toLongOrNull()
+                    ?: 0
+
+                val seconds = Regex("([0-9]+) seconds?")
+                    .find(text)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toLongOrNull()
+                    ?: 0
+
                 response.closeQuietly()
+
                 throw TooManyRequestExceptions(
                     url = response.request.url.toString(),
-                    retryAfter = TimeUnit.HOURS.toMillis(hours)
-                        + TimeUnit.MINUTES.toMillis(minutes)
-                        + TimeUnit.SECONDS.toMillis(seconds),
+                    retryAfter =
+                        TimeUnit.HOURS.toMillis(hours) +
+                        TimeUnit.MINUTES.toMillis(minutes) +
+                        TimeUnit.SECONDS.toMillis(seconds),
                 )
             }
         }
-        val imageRect = response.request.url.fragment?.split(',')
+
+        val imageRect = response.request
+            .url
+            .fragment
+            ?.split(',')
+
         if (imageRect != null && imageRect.size == 4) {
             return context.redrawImageResponse(response) { bitmap ->
+
                 val srcRect = Rect(
                     left = imageRect[0].toInt(),
                     top = imageRect[1].toInt(),
                     right = imageRect[2].toInt(),
                     bottom = imageRect[3].toInt(),
                 )
-                val dstRect = Rect(0, 0, srcRect.width, srcRect.height)
-                val result = context.createBitmap(dstRect.width, dstRect.height)
-                result.drawBitmap(bitmap, srcRect, dstRect)
+
+                val dstRect = Rect(
+                    0,
+                    0,
+                    srcRect.width,
+                    srcRect.height,
+                )
+
+                val result = context.createBitmap(
+                    dstRect.width,
+                    dstRect.height,
+                )
+
+                result.drawBitmap(
+                    bitmap,
+                    srcRect,
+                    dstRect,
+                )
+
                 result
             }
         }
+
         return response
     }
 
@@ -361,9 +665,19 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
     }
 
     override suspend fun getUsername(): String {
-        val doc = webClient.httpGet("https://forums.$DOMAIN_UNAUTHORIZED/").parseHtml().body()
-        val username = doc.getElementById("userlinks")
-            ?.getElementsByAttributeValueContaining("href", "showuser=")
+        applyIgneousCookie()
+
+        val doc = webClient
+            .httpGet("https://forums.$DOMAIN_UNAUTHORIZED/")
+            .parseHtml()
+            .body()
+
+        val username = doc
+            .getElementById("userlinks")
+            ?.getElementsByAttributeValueContaining(
+                "href",
+                "showuser=",
+            )
             ?.firstOrNull()
             ?.ownText()
             ?: if (doc.getElementById("userlinksguest") != null) {
@@ -371,38 +685,71 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
             } else {
                 doc.parseFailed()
             }
+
         return username
     }
 
-    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+    override fun onCreateConfig(
+        keys: MutableCollection<ConfigKey<*>>,
+    ) {
         super.onCreateConfig(keys)
+
         keys.add(userAgentKey)
-        keys.add(igneousKey)
+        keys.add(igneousCookieKey)
+
+        /*
+         * Registered as a source setting for now.
+         *
+         * The actual filtering UI depends on the filter API available
+         * in the current parsers version.
+         */
+        keys.add(suspiciousContentKey)
     }
 
-    override suspend fun getRelatedManga(seed: Manga): List<Manga> {
-        val queryText = seed.title
-        return getList(
-            offset = 0,
+    override suspend fun getRelatedManga(
+        seed: Manga,
+    ): List<Manga> {
+
+        val query = seed.title
+
+        return getListPage(
+            page = 0,
             order = defaultSortOrder,
-            filter = MangaListFilter(query = queryText),
+            filter = MangaListFilter(query = query),
         )
     }
 
     private fun isAuthorized(domain: String): Boolean {
-        val cookies = context.cookieJar.getCookies(domain).mapToSet { x -> x.name }
+        val cookies = context.cookieJar
+            .getCookies(domain)
+            .mapToSet { x -> x.name }
+
         return authCookies.all { it in cookies }
     }
 
     private fun Element.parseRating(): Float {
         return runCatching {
             val style = requireNotNull(attr("style"))
-            val (v1, v2) = ratingPattern.findAll(style).toList()
-            var p1 = v1.groupValues.first().dropLast(2).toInt()
-            val p2 = v2.groupValues.first().dropLast(2).toInt()
+            val (v1, v2) = ratingPattern
+                .findAll(style)
+                .toList()
+
+            var p1 = v1
+                .groupValues
+                .first()
+                .dropLast(2)
+                .toInt()
+
+            val p2 = v2
+                .groupValues
+                .first()
+                .dropLast(2)
+                .toInt()
+
             if (p2 != -1) {
                 p1 += 8
             }
+
             (80 - p1) / 80f
         }.getOrDefault(RATING_UNKNOWN)
     }
@@ -413,23 +760,50 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
     }
 
     private fun String.toMangaTitle(): String {
-        return if (domain == DOMAIN_AUTHORIZED) trim() else cleanupTitle()
+        return if (domain == DOMAIN_AUTHORIZED) {
+            trim()
+        } else {
+            cleanupTitle()
+        }
     }
 
     private fun Element.parseTags(): Set<MangaTag> {
+
         fun Element.parseTag() = textOrNull()?.let {
-            MangaTag(title = it.toTitleCase(Locale.ENGLISH), key = it, source = source)
+            MangaTag(
+                title = it.toTitleCase(Locale.ENGLISH),
+                key = it,
+                source = source,
+            )
         }
+
         val result = ArraySet<MangaTag>()
+
         for (prefix in TAG_PREFIXES) {
-            getElementsByAttributeValueStarting("id", "ta_$prefix").mapNotNullTo(result, Element::parseTag)
-            getElementsByAttributeValueStarting("title", prefix).mapNotNullTo(result, Element::parseTag)
+            getElementsByAttributeValueStarting(
+                "id",
+                "ta_$prefix",
+            ).mapNotNullTo(
+                result,
+                Element::parseTag,
+            )
+
+            getElementsByAttributeValueStarting(
+                "title",
+                prefix,
+            ).mapNotNullTo(
+                result,
+                Element::parseTag,
+            )
         }
+
         return result
     }
 
     private fun Element.extractPreview(): String? {
-        val bg = backgroundOrNull() ?: return null
+        val bg = backgroundOrNull()
+            ?: return null
+
         return buildString {
             append(bg.url)
             append('#')
@@ -444,79 +818,109 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
     }
 
     private fun getNextTimestamp(root: Element): Long {
-        return root.getElementById("unext")
+        return root
+            .getElementById("unext")
             ?.attrAsAbsoluteUrlOrNull("href")
             ?.toHttpUrlOrNull()
             ?.queryParameter("next")
-            ?.toLongOrNull() ?: 1
+            ?.toLongOrNull()
+            ?: 1
     }
 
     private fun MangaListFilter.toSearchQuery(): String? {
         if (isEmpty()) {
             return null
         }
+
         val joiner = StringUtil.StringJoiner(" ")
-        val currentQuery = query
-        if (!currentQuery.isNullOrEmpty()) {
-            joiner.add(currentQuery)
+
+        if (!query.isNullOrEmpty()) {
+            joiner.add(query)
         }
+
         for (tag in tags) {
-            if (tag.key == SUSPICIOUS_TAG_KEY) continue
             if (tag.key.isNumeric()) {
                 continue
             }
+
             joiner.add("tag:\"")
             joiner.append(tag.key)
             joiner.append("\"$")
         }
+
         for (tag in tagsExclude) {
-            if (tag.key == SUSPICIOUS_TAG_KEY) continue
             if (tag.key.isNumeric()) {
                 continue
             }
+
             joiner.add("-tag:\"")
             joiner.append(tag.key)
             joiner.append("\"$")
         }
+
         locale?.let { lc ->
             joiner.add("language:\"")
             joiner.append(lc.toLanguagePath())
             joiner.append("\"$")
         }
-        val currentAuthor = author
-        if (!currentAuthor.isNullOrEmpty()) {
+
+        if (!author.isNullOrEmpty()) {
             joiner.add("artist:\"")
-            joiner.append(currentAuthor)
+            joiner.append(author)
             joiner.append("\"$")
         }
-        return joiner.complete().nullIfEmpty()
+
+        return joiner
+            .complete()
+            .nullIfEmpty()
     }
 
-    private fun Collection<ContentType>.toFCats(): Int = fold(0) { acc, ct ->
-        val cat: Int = when (ct) {
-            ContentType.DOUJINSHI -> 2
-            ContentType.MANGA -> 4
-            ContentType.ARTIST_CG -> 8
-            ContentType.GAME_CG -> 16
-            ContentType.IMAGE_SET -> 32
-            ContentType.COSPLAY -> 64
-            ContentType.ASIAN_PORN -> 128
-            ContentType.COMICS -> 256
-            ContentType.WESTERN -> 512
-            ContentType.MISC -> 1
-            else -> 1
+    /**
+     * E-Hentai category bit masks.
+     *
+     * The values correspond to the f_cats flags used by E-Hentai.
+     */
+    private fun Collection<ContentType>.toFCats(): Int =
+        fold(0) { acc, ct ->
+
+            val cat = when (ct) {
+                ContentType.DOUJINSHI -> 2
+                ContentType.MANGA -> 4
+                ContentType.ARTIST_CG -> 8
+                ContentType.GAME_CG -> 16
+
+                // Western
+                ContentType.WESTERN -> 1
+
+                // Non-H
+                ContentType.NON_H -> 64
+
+                // Image Set
+                ContentType.IMAGE_SET -> 32
+
+                // Cosplay
+                ContentType.COSPLAY -> 128
+
+                // Asian P*rn
+                ContentType.ASIAN_PORN -> 256
+
+                // Misc
+                ContentType.MISC -> 512
+
+                else -> 0
+            }
+
+            acc or cat
         }
-        acc or cat
-    }
 
     private fun checkAuth(): Boolean {
-        val igneousValue = config[igneousKey]
-        if (!igneousValue.isNullOrBlank()) {
-            context.cookieJar.insertCookies(DOMAIN_AUTHORIZED, "igneous=$igneousValue")
-            context.cookieJar.insertCookies(DOMAIN_UNAUTHORIZED, "igneous=$igneousValue")
-        }
-        
+        /*
+         * Apply manually entered igneous before checking authentication.
+         */
+        applyIgneousCookie()
+
         val authorized = isAuthorized(DOMAIN_UNAUTHORIZED)
+
         if (authorized) {
             if (!isAuthorized(DOMAIN_AUTHORIZED)) {
                 context.cookieJar.copyCookies(
@@ -524,10 +928,16 @@ internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(c
                     DOMAIN_AUTHORIZED,
                     authCookies,
                 )
-                context.cookieJar.insertCookies(DOMAIN_AUTHORIZED, "yay=louder")
+
+                context.cookieJar.insertCookies(
+                    DOMAIN_AUTHORIZED,
+                    "yay=louder",
+                )
             }
+
             return true
         }
+
         return false
     }
 }
