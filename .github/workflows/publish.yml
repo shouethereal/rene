@@ -5,7 +5,6 @@ on:
   push:
     branches:
       - master
-      - devel
     paths:
       - 'src/main/kotlin/tsuki/**'
 
