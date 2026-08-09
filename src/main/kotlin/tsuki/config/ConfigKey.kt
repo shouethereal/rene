@@ -43,9 +43,14 @@ public sealed class ConfigKey<T>(
      *
      * Empty value means no custom igneous cookie is configured.
      */
-    public class IgneousCookie(
-    	override val defaultValue: String = "",
-    ) : ConfigKey<String>("igneous_cookie")
+    public class InterceptCloudflare(
+    	override val defaultValue: Boolean = false,
+    ) : ConfigKey<Boolean>("intercept_cloudflare")
+
+    public class String(
+	    key: kotlin.String,
+	    override val defaultValue: kotlin.String,
+    ) : ConfigKey<kotlin.String>(key)
 
 	/**
 	 * Configuration key for disabling automatic chapter update checking.

@@ -64,7 +64,6 @@ internal class ExHentaiParser(
         "ipb_pass_hash",
         "igneous",
     )
-
     /*
      * ExHentai authentication cookie.
      *
@@ -74,14 +73,7 @@ internal class ExHentaiParser(
         key = "exhentai_igneous",
         defaultValue = "",
     )
-
-    /*
-     * Suspicious content remains a configuration key, but is intentionally
-     * kept separate from authentication settings.
-     */
-    private val suspiciousContentKey =
-        ConfigKey.ShowSuspiciousContent(false)
-
+    private val suspiciousContentKey = ConfigKey.ShowSuspiciousContent(false)
     private val nextPages = MutableIntObjectMap<MutableIntLongMap>()
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -696,13 +688,6 @@ internal class ExHentaiParser(
 
         keys.add(userAgentKey)
         keys.add(igneousCookieKey)
-
-        /*
-         * Registered as a source setting for now.
-         *
-         * The actual filtering UI depends on the filter API available
-         * in the current parsers version.
-         */
         keys.add(suspiciousContentKey)
     }
 
