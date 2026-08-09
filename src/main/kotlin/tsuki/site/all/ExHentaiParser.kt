@@ -21,20 +21,16 @@ import tsuki.model.*
 import tsuki.util.*
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.Collections.emptyList
 import java.util.concurrent.TimeUnit
 
 private const val DOMAIN_UNAUTHORIZED = "e-hentai.org"
 private const val DOMAIN_AUTHORIZED = "exhentai.org"
 private val TAG_PREFIXES = arrayOf("male:", "female:", "other:")
 private const val BANNED_RESPONSE_LENGTH = 256L
-
 private const val SUSPICIOUS_TAG_KEY = "tsuki_special_adv_suspicious"
 
-@MangaSourceParser("EXHENTAI", "ExHentai", type = ContentType.HENTAI)
-internal class ExHentaiParser(
-    context: MangaLoaderContext,
-) : PagedMangaParser(context, MangaParserSource.EXHENTAI, pageSize = 25), MangaParserAuthProvider, Interceptor {
+@MangaSourceParser(name = "EXHENTAI", title = "ExHentai", type = ContentType.HENTAI)
+internal class ExHentaiParser(context: MangaLoaderContext,) : PagedMangaParser(context, MangaParserSource.OTHER, pageSize = 25), MangaParserAuthProvider, Interceptor {
 
     override val availableSortOrders: Set<SortOrder> = setOf(SortOrder.NEWEST)
 
@@ -54,9 +50,7 @@ internal class ExHentaiParser(
     private val titleCleanupPattern = Regex("(\\[.*?]|\\([C0-9]*\\))")
     private val spacesCleanupPattern = Regex("(^\\s+|\\s+\$|\\s+(?=\\s))")
     private val authCookies = arrayOf("ipb_member_id", "ipb_pass_hash")
-    
-    private val igneousKey = ConfigKey.Text("igneous_cookie", "Igneous Cookie (Opsional)", "")
-    
+    private val igneousKey = ConfigKey.String("igneous_cookie", "Igneous Cookie (Opsional)", "")
     private val nextPages = MutableIntObjectMap<MutableIntLongMap>()
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -85,7 +79,7 @@ internal class ExHentaiParser(
             ContentType.ARTIST_CG,
             ContentType.GAME_CG,
             ContentType.WESTERN,
-            ContentType.NON_H,
+            ContentType.COMICS,
             ContentType.IMAGE_SET,
             ContentType.COSPLAY,
             ContentType.ASIAN_PORN,
@@ -110,7 +104,9 @@ internal class ExHentaiParser(
         ),
     )
 
-    override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+    // Menyesuaikan dengan kontrak MangaParser terbaru menggunakan offset
+    override suspend fun getList(offset: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        val page = offset / pageSize
         return getListPage(page, order, filter, updateDm = false)
     }
 
@@ -183,8 +179,9 @@ internal class ExHentaiParser(
             val href = a.attrAsRelativeUrl("href")
             val tagsDiv = gLink.nextElementSibling() ?: gLink.parseFailed("tags div not found")
             val rawTitle = gLink.text()
-            val author = tagsDiv.getElementsContainingOwnText("artist:").first()
+            val authorElement = tagsDiv.getElementsContainingOwnText("artist:").first()
                 ?.nextElementSibling()?.textOrNull()
+                
             Manga(
                 id = generateUid(href),
                 title = rawTitle.toMangaTitle(),
@@ -199,7 +196,7 @@ internal class ExHentaiParser(
                     rawTitle.contains("(ongoing)", ignoreCase = true) -> MangaState.ONGOING
                     else -> null
                 },
-                authors = setOfNotNull(author),
+                authors = setOfNotNull(authorElement),
                 source = source,
             )
         }
@@ -325,7 +322,8 @@ internal class ExHentaiParser(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
-        if (response.headersContentLength(BANNED_RESPONSE_LENGTH) <= BANNED_RESPONSE_LENGTH) {
+        val contentLength = response.header("Content-Length")?.toLongOrNull() ?: 0L
+        if (contentLength > 0 && contentLength <= BANNED_RESPONSE_LENGTH) {
             val text = response.peekBody(BANNED_RESPONSE_LENGTH).use { it.string() }
             if (text.contains("IP address has been temporarily banned", ignoreCase = true)) {
                 val hours = Regex("([0-9]+) hours?").find(text)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0
@@ -379,16 +377,15 @@ internal class ExHentaiParser(
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
-        
         keys.add(igneousKey)
     }
 
     override suspend fun getRelatedManga(seed: Manga): List<Manga> {
-        val query = seed.title
-        return getListPage(
-            page = 0,
+        val queryText = seed.title
+        return getList(
+            offset = 0,
             order = defaultSortOrder,
-            filter = MangaListFilter(query = query),
+            filter = MangaListFilter(query = queryText),
         )
     }
 
@@ -420,11 +417,9 @@ internal class ExHentaiParser(
     }
 
     private fun Element.parseTags(): Set<MangaTag> {
-
         fun Element.parseTag() = textOrNull()?.let {
             MangaTag(title = it.toTitleCase(Locale.ENGLISH), key = it, source = source)
         }
-
         val result = ArraySet<MangaTag>()
         for (prefix in TAG_PREFIXES) {
             getElementsByAttributeValueStarting("id", "ta_$prefix").mapNotNullTo(result, Element::parseTag)
@@ -461,12 +456,12 @@ internal class ExHentaiParser(
             return null
         }
         val joiner = StringUtil.StringJoiner(" ")
-        if (!query.isNullOrEmpty()) {
-            joiner.add(query)
+        val currentQuery = query
+        if (!currentQuery.isNullOrEmpty()) {
+            joiner.add(currentQuery)
         }
         for (tag in tags) {
             if (tag.key == SUSPICIOUS_TAG_KEY) continue
-            
             if (tag.key.isNumeric()) {
                 continue
             }
@@ -476,7 +471,6 @@ internal class ExHentaiParser(
         }
         for (tag in tagsExclude) {
             if (tag.key == SUSPICIOUS_TAG_KEY) continue
-            
             if (tag.key.isNumeric()) {
                 continue
             }
@@ -489,9 +483,10 @@ internal class ExHentaiParser(
             joiner.append(lc.toLanguagePath())
             joiner.append("\"$")
         }
-        if (!author.isNullOrEmpty()) {
+        val currentAuthor = author
+        if (!currentAuthor.isNullOrEmpty()) {
             joiner.add("artist:\"")
-            joiner.append(author)
+            joiner.append(currentAuthor)
             joiner.append("\"$")
         }
         return joiner.complete().nullIfEmpty()
@@ -506,10 +501,10 @@ internal class ExHentaiParser(
             ContentType.IMAGE_SET -> 32
             ContentType.COSPLAY -> 64
             ContentType.ASIAN_PORN -> 128
-            ContentType.NON_H -> 256
+            ContentType.COMICS -> 256
             ContentType.WESTERN -> 512
-            ContentType.COMICS -> 512
-            else -> 1 // 1 untuk MISC
+            ContentType.MISC -> 1
+            else -> 1
         }
         acc or cat
     }
