@@ -1,4 +1,4 @@
-package tsuki.config
+package org.koitharu.kotatsu.parsers.config
 
 public sealed class ConfigKey<T>(
 	@JvmField public val key: String,
@@ -34,23 +34,6 @@ public sealed class ConfigKey<T>(
 		public val presetValues: Map<String?, String?>,
 		override val defaultValue: String?,
 	) : ConfigKey<String?>("img_server")
-
-    /**
-     * Configuration key for the ExHentai "igneous" cookie.
-     *
-     * This cookie can be manually supplied by the user when access
-     * to ExHentai requires a valid igneous cookie.
-     *
-     * Empty value means no custom igneous cookie is configured.
-     */
-    public class InterceptCloudflare(
-    	override val defaultValue: Boolean = false,
-    ) : ConfigKey<Boolean>("intercept_cloudflare")
-
-    public class String(
-	    key: kotlin.String,
-	    override val defaultValue: kotlin.String,
-    ) : ConfigKey<kotlin.String>(key)
 
 	/**
 	 * Configuration key for disabling automatic chapter update checking.

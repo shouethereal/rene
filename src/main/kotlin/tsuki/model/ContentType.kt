@@ -17,11 +17,6 @@ public enum class ContentType {
 	HENTAI,
 
 	/**
-	 * ExHentai / E-Hentai content.
-	 */
-	EXHENTAI,
-
-	/**
 	 * Western comics
 	 */
 	COMICS,
@@ -29,10 +24,10 @@ public enum class ContentType {
 	NOVEL,
 
 	/**
-	 * Use this type if no other suits your needs.
+	 * Use this type if no other suits your needs. For example, for an indie manga
 	 */
-	ONE_SHOT,
 
+	ONE_SHOT,
 	DOUJINSHI,
 	IMAGE_SET,
 	ARTIST_CG,
@@ -42,6 +37,8 @@ public enum class ContentType {
 	/**
 	 * ExHentai-specific gallery categories.
 	 */
+	EXHENTAI,
+
 	WESTERN,
 	NON_H,
 	COSPLAY,
